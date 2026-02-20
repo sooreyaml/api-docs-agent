@@ -293,6 +293,57 @@ def api_reference_generate_example(request: Request, body: GenerateExampleReques
     return {"code": code}
 
 
+class TryItOutRequest(BaseModel):
+    url: str = Field(..., description="Full URL to call")
+    method: str = Field(..., description="HTTP method")
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: str | None = Field(None, description="Raw request body string")
+    openapi_url: str | None = Field(None, description="For origin validation")
+
+
+TRY_IT_OUT_TIMEOUT = 30.0
+TRY_IT_OUT_MAX_BODY = 2 * 1024 * 1024  # 2 MB cap on response body
+
+
+@app.post("/api/try-it-out")
+def api_try_it_out(body: TryItOutRequest):
+    import time
+
+    target_url = body.url.strip()
+    parsed = urlparse(target_url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, detail="URL must be http or https")
+
+    if body.openapi_url and settings.allowed_openapi_origins:
+        _check_allowed_origin(body.openapi_url)
+        allowed_origin = _origin_from_url(body.openapi_url)
+        target_origin = _origin_from_url(target_url)
+        if allowed_origin and target_origin and target_origin.rstrip("/") != allowed_origin.rstrip("/"):
+            raise HTTPException(403, detail="Target URL origin does not match the documented API")
+
+    method = (body.method or "GET").upper()
+    req_headers = {k: v for k, v in body.headers.items() if k.lower() not in ("host", "content-length")}
+    content = body.body.encode("utf-8") if body.body else None
+
+    try:
+        start = time.monotonic()
+        with httpx.Client(timeout=TRY_IT_OUT_TIMEOUT, follow_redirects=True) as client:
+            resp = client.request(method, target_url, headers=req_headers, content=content)
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+    except httpx.RequestError as e:
+        raise HTTPException(502, detail=f"Request failed: {e!s}")
+
+    resp_body = resp.text[:TRY_IT_OUT_MAX_BODY]
+    resp_headers = {k: v for k, v in resp.headers.items()}
+
+    return {
+        "status_code": resp.status_code,
+        "headers": resp_headers,
+        "body": resp_body,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
 # --- Serve frontend static export at / (with SPA fallback) ---
 
 

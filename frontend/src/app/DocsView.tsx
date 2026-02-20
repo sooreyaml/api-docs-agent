@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -9,6 +10,7 @@ import type {
   DocsEndpoint,
   DocsTag,
   GenerateExampleResponse,
+  TryItOutResponse,
 } from "@/types/api-docs";
 import {
   Select,
@@ -20,9 +22,30 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+const CodeMirrorEditor = dynamic(
+  () => import("@/components/CodeMirrorEditor").then((m) => ({ default: m.CodeMirrorEditor })),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="h-32 rounded-lg bg-neutral-900/80 border border-neutral-800 animate-pulse" />
+    ),
+  }
+);
+
 const API_DOCS = "/api/agent-docs";
 const GENERATE_EXAMPLE = "/api-reference/generate-example";
+const TRY_IT_OUT = "/api/try-it-out";
 const AGENT_CHAT = "/api/agent/chat";
+const BEARER_STORAGE_KEY = "api-docs-bearer-token";
+
+function getStoredBearerToken(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return sessionStorage.getItem(BEARER_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 export function DocsView() {
   const [docs, setDocs] = useState<AgentDocsResponse | null>(null);
@@ -212,7 +235,18 @@ function DocsUI({
   const [chatLoading, setChatLoading] = useState(false);
   const [contextTagNames, setContextTagNames] = useState<string[]>([]);
   const [atMentionHighlight, setAtMentionHighlight] = useState(0);
+  const [bearerToken, setBearerToken] = useState(() => getStoredBearerToken());
+  const [authPopoverOpen, setAuthPopoverOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    try {
+      if (bearerToken) sessionStorage.setItem(BEARER_STORAGE_KEY, bearerToken);
+      else sessionStorage.removeItem(BEARER_STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, [bearerToken]);
 
   const resizeTextarea = useCallback(() => {
     const el = chatInputRef.current;
@@ -361,6 +395,51 @@ function DocsUI({
             </a>
           </nav>
           <div className="flex-1 min-w-0" />
+          <div className="relative shrink-0">
+              <button
+                type="button"
+                onClick={() => setAuthPopoverOpen((o) => !o)}
+                className="text-sm text-neutral-400 hover:text-neutral-100 shrink-0 transition-colors flex items-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-white/5"
+                aria-expanded={authPopoverOpen}
+                aria-haspopup="dialog"
+              >
+                <span className="hidden sm:inline">Auth</span>
+                <span className="sm:hidden">Auth</span>
+                {bearerToken ? (
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" aria-label="Token set" />
+                ) : null}
+              </button>
+              {authPopoverOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    aria-hidden
+                    onClick={() => setAuthPopoverOpen(false)}
+                  />
+                  <div
+                    className="absolute right-0 top-full mt-1 z-50 w-72 sm:w-80 p-3 rounded-xl border border-white/10 bg-neutral-900 shadow-xl"
+                    role="dialog"
+                    aria-label="Bearer token for Try It Out"
+                  >
+                    <label htmlFor="bearer-token-input" className="block text-xs font-medium text-neutral-400 uppercase tracking-wider mb-2">
+                      Bearer token
+                    </label>
+                    <p className="text-neutral-500 text-xs mb-2">
+                      Used when you click Send on endpoints that require authentication.
+                    </p>
+                    <input
+                      id="bearer-token-input"
+                      type="password"
+                      autoComplete="off"
+                      value={bearerToken}
+                      onChange={(e) => setBearerToken(e.target.value)}
+                      placeholder="Paste your JWT or API key"
+                      className="w-full px-3 py-2 rounded-lg bg-neutral-950 border border-neutral-700 text-neutral-100 text-sm placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/50 focus:border-emerald-500/50"
+                    />
+                  </div>
+                </>
+              )}
+          </div>
           {docs.base_url && (
             <a
               href={`${docs.base_url}/docs`}
@@ -373,7 +452,10 @@ function DocsUI({
           )}
           <button
             type="button"
-            onClick={onReset}
+            onClick={() => {
+              setBearerToken("");
+              onReset();
+            }}
             className="text-sm text-neutral-400 hover:text-neutral-100 shrink-0 transition-colors"
           >
             Change API
@@ -780,6 +862,7 @@ function DocsUI({
               baseUrl={docs.base_url}
               openapiUrl={openapiUrl}
               stacks={docs.stacks}
+              bearerToken={bearerToken}
             />
           ))}
         </main>
@@ -793,11 +876,13 @@ function TagSection({
   baseUrl,
   openapiUrl,
   stacks,
+  bearerToken,
 }: {
   tag: DocsTag;
   baseUrl: string;
   openapiUrl: string | null;
   stacks: { value: string; label: string }[];
+  bearerToken: string;
 }) {
   const tagId = `tag-${tag.name.toLowerCase().replace(/\s+/g, "-")}`;
   return (
@@ -812,10 +897,26 @@ function TagSection({
           baseUrl={baseUrl}
           openapiUrl={openapiUrl}
           stacks={stacks}
+          bearerToken={bearerToken}
         />
       ))}
     </section>
   );
+}
+
+type TabId = "params" | "body" | "code" | "response";
+
+const TAB_LABELS: { id: TabId; label: string }[] = [
+  { id: "params", label: "Parameters" },
+  { id: "body", label: "Body" },
+  { id: "code", label: "Code Example" },
+  { id: "response", label: "Response" },
+];
+
+function statusColor(code: number) {
+  if (code < 300) return "text-emerald-400";
+  if (code < 400) return "text-amber-400";
+  return "text-rose-400";
 }
 
 function EndpointCard({
@@ -823,28 +924,110 @@ function EndpointCard({
   baseUrl,
   openapiUrl,
   stacks,
+  bearerToken,
 }: {
   endpoint: DocsEndpoint;
   baseUrl: string;
   openapiUrl: string | null;
   stacks: { value: string; label: string }[];
+  bearerToken: string;
 }) {
+  const hasParams = endpoint.parameters.length > 0;
+  const hasBody = endpoint.how_to_call.has_body;
+  const defaultTab: TabId = hasParams ? "params" : hasBody ? "body" : "code";
+  const [activeTab, setActiveTab] = useState<TabId>(defaultTab);
+
+  const initParams = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const p of endpoint.parameters) {
+      m[p.name] = p.example != null ? String(p.example) : "";
+    }
+    return m;
+  }, [endpoint.parameters]);
+  const [paramValues, setParamValues] = useState<Record<string, string>>(initParams);
+
+  const initBodyJson = useMemo(() => {
+    if (endpoint.example_body) return JSON.stringify(endpoint.example_body, null, 2);
+    return "{}";
+  }, [endpoint.example_body]);
+  const [bodyJson, setBodyJson] = useState(initBodyJson);
+
   const [selectedStack, setSelectedStack] = useState(stacks[0]?.value ?? "");
-  const [code, setCode] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [genError, setGenError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [generatedCode, setGeneratedCode] = useState<string | null>(null);
+  const [codeLoading, setCodeLoading] = useState(false);
+  const [codeError, setCodeError] = useState<string | null>(null);
+  const [codeCopied, setCodeCopied] = useState(false);
+  const [response, setResponse] = useState<TryItOutResponse | null>(null);
+  const [execLoading, setExecLoading] = useState(false);
+  const [execError, setExecError] = useState<string | null>(null);
+  const [headersExpanded, setHeadersExpanded] = useState(false);
+
+  const liveUrl = useMemo(() => {
+    let u = endpoint.how_to_call.full_url;
+    for (const p of endpoint.parameters.filter((pp) => pp.in === "path")) {
+      const val = paramValues[p.name] ?? String(p.example ?? "");
+      u = u.replace(`{${p.name}}`, encodeURIComponent(val));
+    }
+    const qp = endpoint.parameters.filter((pp) => pp.in === "query");
+    if (qp.length > 0) {
+      const qs = qp.map((p) => {
+        const val = paramValues[p.name] ?? "";
+        return val ? `${encodeURIComponent(p.name)}=${encodeURIComponent(val)}` : null;
+      }).filter(Boolean).join("&");
+      if (qs) u += (u.includes("?") ? "&" : "?") + qs;
+    }
+    return u;
+  }, [endpoint, paramValues]);
+
+  const handleExecute = async () => {
+    setExecLoading(true);
+    setExecError(null);
+    setResponse(null);
+    setActiveTab("response");
+    try {
+      const headers: Record<string, string> = {};
+      if (hasBody) headers["Content-Type"] = "application/json";
+      for (const p of endpoint.parameters.filter((pp) => pp.in === "header")) {
+        const val = paramValues[p.name] ?? "";
+        if (val) headers[p.name] = val;
+      }
+      if (endpoint.how_to_call.needs_auth) {
+        const authParam = endpoint.parameters.find(
+          (p) => p.in === "header" && p.name.toLowerCase() === "authorization"
+        );
+        const authFromParam = authParam ? (paramValues[authParam.name] ?? "").trim() : "";
+        const authFromGlobal = bearerToken.trim();
+        let authValue = authFromParam || authFromGlobal;
+        if (authValue && !authValue.toLowerCase().startsWith("bearer ")) {
+          authValue = "Bearer " + authValue;
+        }
+        if (authValue) headers["Authorization"] = authValue;
+      }
+      const reqBody: Record<string, unknown> = { url: liveUrl, method: endpoint.method, headers };
+      if (hasBody && bodyJson.trim()) reqBody.body = bodyJson;
+      if (openapiUrl) reqBody.openapi_url = openapiUrl;
+      const res = await fetch(TRY_IT_OUT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reqBody),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      setResponse(data as TryItOutResponse);
+    } catch (e) {
+      setExecError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setExecLoading(false);
+    }
+  };
 
   const handleGenerate = async () => {
-    setLoading(true);
-    setGenError(null);
-    setCode(null);
+    setCodeLoading(true);
+    setCodeError(null);
+    setGeneratedCode(null);
     try {
       const body: Record<string, string | null> = {
-        path: endpoint.path,
-        method: endpoint.method,
-        stack: selectedStack,
-        base_url: baseUrl,
+        path: endpoint.path, method: endpoint.method, stack: selectedStack, base_url: baseUrl,
       };
       if (openapiUrl) body.openapi_url = openapiUrl;
       const res = await fetch(GENERATE_EXAMPLE, {
@@ -852,328 +1035,248 @@ function EndpointCard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data: GenerateExampleResponse | { detail?: string } =
-        await res.json();
-      if (!res.ok)
-        throw new Error((data as { detail?: string }).detail || res.statusText);
-      setCode((data as GenerateExampleResponse).code);
+      const data: GenerateExampleResponse | { detail?: string } = await res.json();
+      if (!res.ok) throw new Error((data as { detail?: string }).detail || res.statusText);
+      setGeneratedCode((data as GenerateExampleResponse).code);
     } catch (e) {
-      setGenError(e instanceof Error ? e.message : "Failed to generate");
+      setCodeError(e instanceof Error ? e.message : "Failed to generate");
     } finally {
-      setLoading(false);
+      setCodeLoading(false);
     }
   };
 
-  const handleCopy = () => {
-    if (!code) return;
-    navigator.clipboard.writeText(code).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+  const handleCopyCode = () => {
+    if (!generatedCode) return;
+    navigator.clipboard.writeText(generatedCode).then(() => {
+      setCodeCopied(true);
+      setTimeout(() => setCodeCopied(false), 2000);
     });
   };
 
+  const visibleTabs = TAB_LABELS.filter((t) => {
+    if (t.id === "params" && !hasParams) return false;
+    if (t.id === "body" && !hasBody) return false;
+    return true;
+  });
+
+  let prettyResponseBody = response?.body ?? "";
+  if (response) {
+    try { prettyResponseBody = JSON.stringify(JSON.parse(response.body), null, 2); } catch { /* keep raw */ }
+  }
+
+  const authParam = endpoint.parameters.find((p) => p.in === "header" && p.name.toLowerCase() === "authorization");
+  const authFromParam = authParam ? (paramValues[authParam.name] ?? "").trim() : "";
+  const hasAuthToken = !!(authFromParam || bearerToken.trim());
+
+  const showAuthHint =
+    endpoint.how_to_call.needs_auth &&
+    !hasAuthToken &&
+    (!response || response.status_code === 401);
+
   return (
-    <article
-      id={endpoint.endpoint_id}
-      className="mb-6 sm:mb-8 p-4 sm:p-6 rounded-2xl bg-card border border-neutral-800"
-    >
-      <div className="flex items-center gap-2 sm:gap-3 flex-wrap mb-2 min-w-0">
-        <span
-          className={`method method-${endpoint.method.toLowerCase()} shrink-0`}
-        >
-          {endpoint.method}
-        </span>
-        <code className="text-xs sm:text-sm text-neutral-400 bg-neutral-900 px-2.5 py-1 rounded-lg break-all min-w-0 font-mono">
-          {endpoint.path}
-        </code>
-      </div>
-      {endpoint.summary && (
-        <p className="font-medium text-neutral-100 mb-2">{endpoint.summary}</p>
-      )}
-      {endpoint.description && (
-        <div className="text-neutral-500 text-sm whitespace-pre-wrap mb-4 leading-relaxed">
-          {endpoint.description}
-        </div>
-      )}
-
-      <div className="mb-4 p-4 rounded-xl bg-neutral-900/50 border border-neutral-800">
-        <p className="text-[11px] font-medium text-neutral-500 uppercase tracking-widest mb-2">
-          Request
-        </p>
-        <pre className="text-sm text-neutral-300 overflow-x-auto font-mono">
-          <span className={`method method-${endpoint.method.toLowerCase()}`}>
-            {endpoint.method}
-          </span>{" "}
-          {endpoint.how_to_call.full_url}
-        </pre>
-        {(endpoint.how_to_call.needs_auth || endpoint.how_to_call.has_body) && (
-          <p className="text-xs text-neutral-500 mt-2">
-            Headers:{" "}
-            {endpoint.how_to_call.needs_auth && "Authorization: Bearer <token>"}
-            {endpoint.how_to_call.needs_auth &&
-              endpoint.how_to_call.has_body &&
-              ", "}
-            {endpoint.how_to_call.has_body && "Content-Type: application/json"}
-          </p>
-        )}
+    <article id={endpoint.endpoint_id} className="mb-6 sm:mb-8 rounded-2xl bg-card border border-neutral-800 overflow-hidden">
+      {/* Header: method + live URL + Send button */}
+      <div className="flex items-center gap-2 sm:gap-3 flex-wrap p-4 sm:px-6 sm:pt-6 sm:pb-3 min-w-0">
+        <span className={`method method-${endpoint.method.toLowerCase()} shrink-0`}>{endpoint.method}</span>
+        <code className="flex-1 min-w-0 text-xs sm:text-sm text-neutral-300 bg-neutral-900 px-2.5 py-1.5 rounded-lg break-all font-mono">{liveUrl}</code>
+        <button type="button" onClick={handleExecute} disabled={execLoading} className="shrink-0 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-sm font-medium transition-colors">
+          {execLoading ? "Sending..." : "Send"}
+        </button>
       </div>
 
-      <div className="mb-4 p-4 rounded-xl bg-neutral-900/40 border border-neutral-800">
-        <h4 className="text-sm font-medium text-neutral-200 mb-1">
-          Get code for your stack
-        </h4>
-        <p className="text-neutral-500 text-sm mb-3">
-          Pick a framework and we’ll generate a ready-to-use example.
-        </p>
-        <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
-          <div className="flex flex-col gap-1.5 min-w-0 sm:min-w-[220px]">
-            <span className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
-              Framework
-            </span>
-            <Select value={selectedStack} onValueChange={setSelectedStack}>
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Pick a framework" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectLabel>Web</SelectLabel>
-                  {stacks
-                    .filter(
-                      (s) =>
-                        ![
-                          "react-native",
-                          "flutter",
-                          "swift-ios",
-                          "kotlin-android",
-                        ].includes(s.value)
-                    )
-                    .map((s) => (
-                      <SelectItem key={s.value} value={s.value}>
-                        {s.label}
-                      </SelectItem>
-                    ))}
-                </SelectGroup>
-                <SelectGroup>
-                  <SelectLabel>Mobile</SelectLabel>
-                  {stacks
-                    .filter((s) =>
-                      [
-                        "react-native",
-                        "flutter",
-                        "swift-ios",
-                        "kotlin-android",
-                      ].includes(s.value)
-                    )
-                    .map((s) => (
-                      <SelectItem key={s.value} value={s.value}>
-                        {s.label}
-                      </SelectItem>
-                    ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
-          <button
-            type="button"
-            onClick={handleGenerate}
-            disabled={loading}
-            className="sm:self-end px-4 py-2.5 rounded-xl bg-neutral-100 hover:bg-white disabled:opacity-50 text-neutral-900 text-sm font-medium touch-manipulation transition-colors shrink-0"
-          >
-            {loading ? "Generating…" : "Generate example"}
+      <div className="px-4 sm:px-6 pb-3">
+        {endpoint.summary && <p className="font-medium text-neutral-100 mb-1">{endpoint.summary}</p>}
+        {endpoint.description && <div className="text-neutral-500 text-sm whitespace-pre-wrap leading-relaxed">{endpoint.description}</div>}
+      </div>
+
+      {/* Tab bar */}
+      <div className="border-t border-neutral-800 px-4 sm:px-6 flex gap-0 overflow-x-auto">
+        {visibleTabs.map((t) => (
+          <button key={t.id} type="button" onClick={() => setActiveTab(t.id)}
+            className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${activeTab === t.id ? "border-emerald-500 text-neutral-100" : "border-transparent text-neutral-500 hover:text-neutral-300"}`}>
+            {t.label}
+            {t.id === "response" && response && (
+              <span className={`ml-1.5 text-xs font-semibold ${statusColor(response.status_code)}`}>{response.status_code}</span>
+            )}
           </button>
-        </div>
-        {genError && (
-          <p className="text-neutral-400 text-sm mt-3">{genError}</p>
-        )}
-        {code && (
-          <div className="relative mt-2 -mx-1 sm:mx-0">
-            <pre className="p-3 sm:p-4 rounded-xl bg-neutral-900/80 border border-neutral-800 text-xs sm:text-sm text-neutral-300 overflow-x-auto max-w-full font-mono">
-              <code className="block min-w-0">{code}</code>
-            </pre>
-            <button
-              type="button"
-              onClick={handleCopy}
-              className="absolute top-2.5 right-2.5 px-2.5 py-1.5 rounded-lg text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-300 transition-colors"
-            >
-              {copied ? "Copied!" : "Copy"}
-            </button>
-          </div>
-        )}
+        ))}
       </div>
 
-      {endpoint.parameters.length > 0 && (
-        <div className="mb-4 overflow-x-auto -mx-1 sm:mx-0">
-          <h4 className="text-sm font-medium text-neutral-200 mb-2">
-            Parameters
-          </h4>
-          <table className="w-full min-w-[400px] text-sm border-collapse border border-neutral-800 rounded-xl overflow-hidden">
-            <thead>
-              <tr className="bg-neutral-900/80">
-                <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                  Name
-                </th>
-                <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                  In
-                </th>
-                <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                  Required
-                </th>
-                <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                  Description
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {endpoint.parameters.map((p) => (
-                <tr key={p.name} className="border-b border-neutral-800/80">
-                  <td className="p-3">
-                    <code className="text-neutral-200 font-mono text-xs">
-                      {p.name}
-                    </code>
-                  </td>
-                  <td className="p-3 text-neutral-500">{p.in}</td>
-                  <td className="p-3 text-neutral-500">
-                    {p.required ? "required" : "optional"}
-                  </td>
-                  <td className="p-3 text-neutral-500">{p.description}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+      {/* Tab content */}
+      <div className="p-4 sm:p-6 pt-4 border-t border-neutral-800 min-h-[120px]">
+        {/* PLACEHOLDER_TAB_CONTENT */}
+        {/* Parameters tab */}
+        {activeTab === "params" && hasParams && (
+          <div className="space-y-3">
+            {endpoint.parameters.map((p) => (
+              <div key={p.name} className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <div className="flex items-center gap-2 sm:w-48 shrink-0">
+                  <code className="text-neutral-200 font-mono text-xs">{p.name}</code>
+                  <span className="text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500">{p.in}</span>
+                  {p.required && <span className="text-[10px] text-rose-400 font-semibold">*</span>}
+                </div>
+                <input type="text" value={paramValues[p.name] ?? ""} onChange={(e) => setParamValues((prev) => ({ ...prev, [p.name]: e.target.value }))}
+                  placeholder={p.example != null ? String(p.example) : p.type}
+                  className="flex-1 min-w-0 px-3 py-2 rounded-lg bg-neutral-900/80 border border-neutral-700 text-neutral-200 text-sm placeholder-neutral-600 font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500/50 focus:border-emerald-500/50" />
+                {p.description && <span className="text-xs text-neutral-600 hidden lg:block max-w-[200px] truncate" title={p.description}>{p.description}</span>}
+              </div>
+            ))}
+          </div>
+        )}
 
-      {endpoint.request_body_schema && (
-        <div className="mb-4">
-          <h4 className="text-sm font-medium text-neutral-200 mb-2">
-            Request body
-          </h4>
-          {endpoint.request_body_schema.description && (
-            <p className="text-neutral-500 text-sm mb-2">
-              {endpoint.request_body_schema.description}
-            </p>
-          )}
-          {endpoint.request_body_schema.schema?.properties && (
-            <div className="overflow-x-auto -mx-1 sm:mx-0">
-              <table className="w-full min-w-[400px] text-sm border-collapse border border-neutral-800 rounded-xl overflow-hidden">
-                <thead>
-                  <tr className="bg-neutral-900/80">
-                    <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                      Field
-                    </th>
-                    <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                      Type
-                    </th>
-                    <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                      Required
-                    </th>
-                    <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                      Description
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {endpoint.request_body_schema.schema.properties.map(
-                    (prop) => (
-                      <tr
-                        key={prop.name}
-                        className="border-b border-neutral-800/80"
-                      >
-                        <td className="p-3">
-                          <code className="text-neutral-200 font-mono text-xs">
-                            {prop.name}
-                          </code>
-                        </td>
-                        <td className="p-3 text-neutral-500">{prop.type}</td>
-                        <td className="p-3 text-neutral-500">
-                          {prop.required ? "required" : "optional"}
-                        </td>
-                        <td className="p-3 text-neutral-500">
-                          {prop.description}
-                        </td>
-                      </tr>
-                    )
-                  )}
-                </tbody>
-              </table>
+        {/* Body tab */}
+        {activeTab === "body" && hasBody && (
+          <div>
+            {endpoint.request_body_schema?.description && <p className="text-neutral-500 text-sm mb-3">{endpoint.request_body_schema.description}</p>}
+            <div className="rounded-lg overflow-hidden border border-neutral-800">
+              <CodeMirrorEditor value={bodyJson} onChange={(val) => setBodyJson(val)} height="240px" theme="dark" basicSetup={{ lineNumbers: true, foldGutter: true, bracketMatching: true }} className="text-sm codemirror-dark" />
             </div>
-          )}
-        </div>
-      )}
+            {endpoint.request_body_schema?.schema?.properties && (
+              <div className="mt-4 overflow-x-auto">
+                <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">Schema</p>
+                <table className="w-full min-w-[400px] text-sm border-collapse border border-neutral-800 rounded-xl overflow-hidden">
+                  <thead><tr className="bg-neutral-900/80">
+                    <th className="text-left p-2.5 border-b border-neutral-800 text-neutral-300 font-medium">Field</th>
+                    <th className="text-left p-2.5 border-b border-neutral-800 text-neutral-300 font-medium">Type</th>
+                    <th className="text-left p-2.5 border-b border-neutral-800 text-neutral-300 font-medium">Required</th>
+                    <th className="text-left p-2.5 border-b border-neutral-800 text-neutral-300 font-medium">Description</th>
+                  </tr></thead>
+                  <tbody>
+                    {endpoint.request_body_schema.schema.properties.map((prop) => (
+                      <tr key={prop.name} className="border-b border-neutral-800/80">
+                        <td className="p-2.5"><code className="text-neutral-200 font-mono text-xs">{prop.name}</code></td>
+                        <td className="p-2.5 text-neutral-500 text-xs">{prop.type}</td>
+                        <td className="p-2.5 text-neutral-500 text-xs">{prop.required ? "required" : "optional"}</td>
+                        <td className="p-2.5 text-neutral-500 text-xs">{prop.description}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
 
-      {endpoint.responses.length > 0 && (
-        <div>
-          <h4 className="text-sm font-medium text-neutral-200 mb-2">
-            Responses
-          </h4>
-          <ul className="space-y-4">
-            {endpoint.responses.map((r) => (
-              <li
-                key={r.code}
-                className="p-4 rounded-xl bg-neutral-900/50 border border-neutral-800 space-y-2"
-              >
-                <p className="text-sm">
-                  <strong className="text-neutral-200">{r.code}</strong>:{" "}
-                  <span className="text-neutral-500">{r.description}</span>
-                </p>
-                {r.body_schema?.properties &&
-                  r.body_schema.properties.length > 0 && (
-                    <div className="mt-3">
-                      <p className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-2">
-                        Response body
-                      </p>
-                      <div className="overflow-x-auto -mx-1 sm:mx-0">
-                        <table className="w-full min-w-[400px] text-sm border-collapse border border-neutral-800 rounded-xl overflow-hidden">
-                          <thead>
-                            <tr className="bg-neutral-900/80">
-                              <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                                Field
-                              </th>
-                              <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                                Type
-                              </th>
-                              <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                                Required
-                              </th>
-                              <th className="text-left p-3 border-b border-neutral-800 text-neutral-300 font-medium">
-                                Description
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {r.body_schema.properties.map((prop) => (
-                              <tr
-                                key={prop.name}
-                                className="border-b border-neutral-800/80"
-                              >
-                                <td className="p-3">
-                                  <code className="text-neutral-200 font-mono text-xs">
-                                    {prop.name}
-                                  </code>
-                                </td>
-                                <td className="p-3 text-neutral-500">
-                                  {prop.type}
-                                </td>
-                                <td className="p-3 text-neutral-500">
-                                  {prop.required ? "required" : "optional"}
-                                </td>
-                                <td className="p-3 text-neutral-500">
-                                  {prop.description}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
+        {/* Code Example tab */}
+        {activeTab === "code" && (
+          <div>
+            <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center mb-4">
+              <div className="flex flex-col gap-1.5 min-w-0 sm:min-w-[220px]">
+                <span className="text-xs font-medium text-neutral-500 uppercase tracking-wider">Framework</span>
+                <Select value={selectedStack} onValueChange={setSelectedStack}>
+                  <SelectTrigger className="w-full"><SelectValue placeholder="Pick a framework" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup><SelectLabel>Web</SelectLabel>
+                      {stacks.filter((s) => !["react-native","flutter","swift-ios","kotlin-android"].includes(s.value)).map((s) => (
+                        <SelectItem key={s.value} value={s.value}>{s.label}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                    <SelectGroup><SelectLabel>Mobile</SelectLabel>
+                      {stacks.filter((s) => ["react-native","flutter","swift-ios","kotlin-android"].includes(s.value)).map((s) => (
+                        <SelectItem key={s.value} value={s.value}>{s.label}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+              <button type="button" onClick={handleGenerate} disabled={codeLoading}
+                className="sm:self-end px-4 py-2.5 rounded-xl bg-neutral-100 hover:bg-white disabled:opacity-50 text-neutral-900 text-sm font-medium touch-manipulation transition-colors shrink-0">
+                {codeLoading ? "Generating..." : "Generate example"}
+              </button>
+            </div>
+            {codeError && <p className="text-neutral-400 text-sm mb-3">{codeError}</p>}
+            {generatedCode && (
+              <div className="relative rounded-lg overflow-hidden border border-neutral-800">
+                <CodeMirrorEditor value={generatedCode} readOnly editable={false} height="auto" maxHeight="500px" theme="dark" basicSetup={{ lineNumbers: true, foldGutter: false }} className="text-sm codemirror-dark" />
+                <button type="button" onClick={handleCopyCode} className="absolute top-2.5 right-2.5 px-2.5 py-1.5 rounded-lg text-xs bg-neutral-800/90 hover:bg-neutral-700 text-neutral-300 transition-colors z-10">
+                  {codeCopied ? "Copied!" : "Copy"}
+                </button>
+              </div>
+            )}
+            {!generatedCode && !codeLoading && !codeError && (
+              <p className="text-neutral-600 text-sm">Select a framework and click &quot;Generate example&quot; to see code.</p>
+            )}
+          </div>
+        )}
+
+        {/* Response tab */}
+        {activeTab === "response" && (
+          <div>
+            {execLoading && (
+              <div className="flex items-center gap-3 py-6">
+                <div className="w-5 h-5 rounded-full border-2 border-neutral-600 border-t-emerald-500 animate-spin" />
+                <span className="text-neutral-500 text-sm">Sending request...</span>
+              </div>
+            )}
+            {execError && <div className="rounded-xl bg-rose-950/40 border border-rose-800/60 text-rose-200 px-4 py-3 text-sm">{execError}</div>}
+            {showAuthHint && (
+              <div className="rounded-xl bg-amber-950/30 border border-amber-800/50 text-amber-200 px-4 py-3 text-sm mb-4">
+                Add a Bearer token above to authenticate. Click &quot;Auth&quot; in the header to set your token.
+              </div>
+            )}
+            {response && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-4">
+                  <span className={`text-lg font-bold ${statusColor(response.status_code)}`}>{response.status_code}</span>
+                  <span className="text-neutral-500 text-sm">{response.elapsed_ms}ms</span>
+                </div>
+                <div>
+                  <button type="button" onClick={() => setHeadersExpanded((v) => !v)} className="text-xs font-medium text-neutral-500 uppercase tracking-wider hover:text-neutral-300 transition-colors flex items-center gap-1">
+                    Response Headers <span className="text-[10px]">{headersExpanded ? "\u25BC" : "\u25B6"}</span>
+                  </button>
+                  {headersExpanded && (
+                    <div className="mt-2 rounded-lg bg-neutral-900/80 border border-neutral-800 p-3 text-xs font-mono text-neutral-400 max-h-40 overflow-auto">
+                      {Object.entries(response.headers).map(([k, v]) => (
+                        <div key={k}><span className="text-neutral-300">{k}</span>: {v}</div>
+                      ))}
                     </div>
                   )}
+                </div>
+                <div>
+                  <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">Response Body</p>
+                  <div className="rounded-lg overflow-hidden border border-neutral-800">
+                    <CodeMirrorEditor value={prettyResponseBody} readOnly editable={false} height="auto" maxHeight="400px" theme="dark" basicSetup={{ lineNumbers: true, foldGutter: true }} className="text-sm codemirror-dark" />
+                  </div>
+                </div>
+              </div>
+            )}
+            {!response && !execLoading && !execError && (
+              <p className="text-neutral-600 text-sm py-4">Click &quot;Send&quot; to execute the request and see the response.</p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Response schema */}
+      {endpoint.responses.length > 0 && (
+        <div className="px-4 sm:px-6 pb-4 sm:pb-6">
+          <h4 className="text-sm font-medium text-neutral-200 mb-2">Response Schema</h4>
+          <ul className="space-y-3">
+            {endpoint.responses.map((r) => (
+              <li key={r.code} className="p-3 rounded-xl bg-neutral-900/50 border border-neutral-800 space-y-2">
+                <p className="text-sm"><strong className="text-neutral-200">{r.code}</strong>: <span className="text-neutral-500">{r.description}</span></p>
+                {r.body_schema?.properties && r.body_schema.properties.length > 0 && (
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="w-full min-w-[400px] text-xs border-collapse border border-neutral-800 rounded-xl overflow-hidden">
+                      <thead><tr className="bg-neutral-900/80">
+                        <th className="text-left p-2 border-b border-neutral-800 text-neutral-300 font-medium">Field</th>
+                        <th className="text-left p-2 border-b border-neutral-800 text-neutral-300 font-medium">Type</th>
+                        <th className="text-left p-2 border-b border-neutral-800 text-neutral-300 font-medium">Description</th>
+                      </tr></thead>
+                      <tbody>
+                        {r.body_schema.properties.map((prop) => (
+                          <tr key={prop.name} className="border-b border-neutral-800/80">
+                            <td className="p-2"><code className="text-neutral-200 font-mono text-xs">{prop.name}</code></td>
+                            <td className="p-2 text-neutral-500">{prop.type}</td>
+                            <td className="p-2 text-neutral-500">{prop.description}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
                 {r.body_schema && !r.body_schema.properties?.length && (
-                  <p className="text-xs text-neutral-500 mt-1">
-                    Body type:{" "}
-                    <code className="text-neutral-400">
-                      {r.body_schema.type ?? "object"}
-                    </code>
-                  </p>
+                  <p className="text-xs text-neutral-500">Type: <code className="text-neutral-400">{r.body_schema.type ?? "object"}</code></p>
                 )}
               </li>
             ))}

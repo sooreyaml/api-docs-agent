@@ -1,7 +1,138 @@
 """Generate API reference HTML from OpenAPI schema."""
+from __future__ import annotations
+
 from html import escape
+from typing import Any
 
 from .docs_agent import STACKS
+
+
+_NAME_EXAMPLES: dict[str, Any] = {
+    "email": "user@example.com",
+    "password": "P@ssw0rd123",
+    "username": "johndoe",
+    "name": "John Doe",
+    "first_name": "John",
+    "firstName": "John",
+    "last_name": "Doe",
+    "lastName": "Doe",
+    "phone": "+1234567890",
+    "phone_number": "+1234567890",
+    "phoneNumber": "+1234567890",
+    "address": "123 Main St",
+    "city": "San Francisco",
+    "state": "CA",
+    "country": "US",
+    "zip": "94105",
+    "zip_code": "94105",
+    "url": "https://example.com",
+    "website": "https://example.com",
+    "title": "My Title",
+    "description": "A short description",
+    "message": "Hello, world!",
+    "content": "Lorem ipsum dolor sit amet",
+    "token": "eyJhbGciOiJIUzI1NiIs...",
+    "code": "ABC123",
+    "otp": "123456",
+    "amount": 99.99,
+    "price": 29.99,
+    "quantity": 1,
+    "count": 10,
+    "page": 1,
+    "limit": 20,
+    "offset": 0,
+    "per_page": 20,
+    "perPage": 20,
+    "page_size": 20,
+    "pageSize": 20,
+    "sort": "created_at",
+    "order": "desc",
+    "search": "keyword",
+    "query": "search term",
+    "q": "search term",
+    "status": "active",
+    "type": "default",
+    "role": "user",
+    "currency": "USD",
+    "language": "en",
+    "locale": "en-US",
+    "lat": 37.7749,
+    "lng": -122.4194,
+    "latitude": 37.7749,
+    "longitude": -122.4194,
+}
+
+
+def _example_value_for_field(name: str, typ: str, schema: dict | None = None) -> Any:
+    """Derive a realistic example value from field name, type, and optional schema."""
+    if schema and isinstance(schema, dict):
+        if "example" in schema:
+            return schema["example"]
+        if "default" in schema:
+            return schema["default"]
+        if "enum" in schema and schema["enum"]:
+            return schema["enum"][0]
+
+    name_lower = name.lower().replace("-", "_")
+    if name_lower in _NAME_EXAMPLES:
+        return _NAME_EXAMPLES[name_lower]
+    if "id" in name_lower:
+        return 1
+    if "date" in name_lower or "time" in name_lower:
+        return "2025-01-15T09:30:00Z"
+    if "is_" in name_lower or name_lower.startswith("has_") or name_lower.startswith("enable"):
+        return True
+
+    type_lower = (typ or "").lower()
+    if "int" in type_lower:
+        return 0
+    if type_lower in ("number", "float", "double"):
+        return 0.0
+    if type_lower == "boolean":
+        return True
+    if type_lower == "string":
+        return "string"
+    return "string"
+
+
+def _generate_example_json(schema: dict | None, openapi_schema: dict, depth: int = 0) -> Any:
+    """Build a complete example JSON value from a schema, recursively."""
+    if not schema or not isinstance(schema, dict) or depth > 5:
+        return None
+    resolved = _resolve_schema(schema, openapi_schema)
+    if not resolved or not isinstance(resolved, dict):
+        return None
+
+    if "example" in resolved:
+        return resolved["example"]
+
+    typ = resolved.get("type", "")
+    if typ == "object" or resolved.get("properties"):
+        obj: dict[str, Any] = {}
+        for prop_name, prop_schema in (resolved.get("properties") or {}).items():
+            if not isinstance(prop_schema, dict):
+                continue
+            prop_resolved = _resolve_schema(prop_schema, openapi_schema) or prop_schema
+            prop_type = prop_resolved.get("type", _schema_type_str(prop_schema))
+            if prop_type == "object" or prop_resolved.get("properties"):
+                obj[prop_name] = _generate_example_json(prop_schema, openapi_schema, depth + 1)
+            elif prop_type == "array":
+                items = prop_resolved.get("items")
+                if items and isinstance(items, dict):
+                    item_val = _generate_example_json(items, openapi_schema, depth + 1)
+                    obj[prop_name] = [item_val] if item_val is not None else []
+                else:
+                    obj[prop_name] = []
+            else:
+                obj[prop_name] = _example_value_for_field(prop_name, prop_type, prop_resolved)
+        return obj
+    if typ == "array":
+        items = resolved.get("items")
+        if items and isinstance(items, dict):
+            item_val = _generate_example_json(items, openapi_schema, depth + 1)
+            return [item_val] if item_val is not None else []
+        return []
+    return _example_value_for_field("", typ, resolved)
 
 
 def _get_schema_by_name(openapi_schema: dict, name: str) -> dict | None:
@@ -195,11 +326,16 @@ def _slug(s: str) -> str:
 
 
 def _has_auth(op: dict) -> bool:
-    # True if operation has bearer security.
+    # True if operation has bearer (or similar) security. OpenAPI security is a list of
+    # objects keyed by scheme name (e.g. {"bearerAuth": []}); we check the keys.
     sec = op.get("security") or []
     for s in sec:
-        if isinstance(s, dict) and any("Bearer" in str(v) or "bearer" in str(v).lower() for v in s.values()):
-            return True
+        if not isinstance(s, dict):
+            continue
+        for key in s.keys():
+            k = str(key).lower()
+            if "bearer" in k or "jwt" in k or "oauth" in k or "token" in k:
+                return True
     return False
 
 
@@ -248,11 +384,14 @@ def _schema_to_data(schema: dict | None, openapi_schema: dict) -> dict | None:
                 prop_resolved = _resolve_schema(prop_schema, openapi_schema)
                 if isinstance(prop_resolved, dict):
                     desc = prop_resolved.get("description") or ""
+            prop_resolved = _resolve_schema(prop_schema, openapi_schema) or prop_schema
+            example = _example_value_for_field(prop_name, typ, prop_resolved if isinstance(prop_resolved, dict) else None)
             properties.append({
                 "name": prop_name,
                 "type": typ,
                 "required": prop_name in required,
                 "description": desc,
+                "example": example,
             })
         return {"type": "object", "properties": properties}
     ref = schema.get("$ref")
@@ -344,20 +483,34 @@ def build_api_reference_data(openapi_schema: dict, base_url: str = "") -> dict:
             needs_auth = _has_auth(op)
             has_body = method.upper() in ("POST", "PUT", "PATCH") and bool(req_body)
 
-            parameters_data = [
-                {
-                    "name": p.get("name", ""),
+            parameters_data = []
+            for p in params:
+                p_schema = p.get("schema") or {}
+                p_type = _schema_type_str(p_schema) if isinstance(p_schema, dict) else "string"
+                p_name = p.get("name", "")
+                p_example = _example_value_for_field(p_name, p_type, p_schema if isinstance(p_schema, dict) else None)
+                parameters_data.append({
+                    "name": p_name,
                     "in": p.get("in", "query"),
                     "required": bool(p.get("required")),
                     "description": (p.get("description") or "").replace("\n", " "),
-                }
-                for p in params
-            ]
+                    "type": p_type,
+                    "example": p_example,
+                })
             responses_data = [
                 _response_to_data(code, content, openapi_schema)
                 for code, content in responses.items()
             ]
             request_body_data = _request_body_to_data(req_body, openapi_schema) if req_body else None
+
+            example_body = None
+            if req_body:
+                rb_content = req_body.get("content", {}) or {}
+                for mt in ("application/json", "application/json; charset=utf-8"):
+                    ms = rb_content.get(mt)
+                    if isinstance(ms, dict) and ms.get("schema"):
+                        example_body = _generate_example_json(ms["schema"], openapi_schema)
+                        break
 
             endpoints.append({
                 "endpoint_id": endpoint_id,
@@ -372,6 +525,7 @@ def build_api_reference_data(openapi_schema: dict, base_url: str = "") -> dict:
                 },
                 "parameters": parameters_data,
                 "request_body_schema": request_body_data,
+                "example_body": example_body,
                 "responses": responses_data,
             })
         tags_payload.append({"name": tag, "endpoints": endpoints})

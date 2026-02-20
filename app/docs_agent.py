@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import json
 import logging
 from typing import Any
 
@@ -23,10 +26,15 @@ STACKS = [
 
 
 def _has_auth(op: dict) -> bool:
+    # OpenAPI security is keyed by scheme name (e.g. {"bearerAuth": []}); check keys.
     sec = op.get("security") or []
     for s in sec:
-        if isinstance(s, dict) and any("Bearer" in str(v) or "bearer" in str(v).lower() for v in s.values()):
-            return True
+        if not isinstance(s, dict):
+            continue
+        for key in s.keys():
+            k = str(key).lower()
+            if "bearer" in k or "jwt" in k or "oauth" in k or "token" in k:
+                return True
     return False
 
 
@@ -43,6 +51,134 @@ def _get_body_summary(op: dict) -> str:
     return ", ".join(props.keys()) if props else "body"
 
 
+def _extract_operation_details(op: dict) -> dict:
+    """Parse an OpenAPI operation into structured details with example values."""
+    from .api_reference import _example_value_for_field, _generate_example_json, _resolve_schema, _schema_type_str
+
+    params = op.get("parameters") or []
+    path_params: list[dict[str, Any]] = []
+    query_params: list[dict[str, Any]] = []
+    header_params: list[dict[str, Any]] = []
+
+    for p in params:
+        p_schema = p.get("schema") or {}
+        p_type = _schema_type_str(p_schema) if isinstance(p_schema, dict) else "string"
+        p_name = p.get("name", "")
+        example = _example_value_for_field(p_name, p_type, p_schema if isinstance(p_schema, dict) else None)
+        entry = {"name": p_name, "type": p_type, "required": bool(p.get("required")), "example": example}
+        loc = p.get("in", "query")
+        if loc == "path":
+            path_params.append(entry)
+        elif loc == "query":
+            query_params.append(entry)
+        elif loc == "header":
+            header_params.append(entry)
+
+    body_fields: list[dict[str, Any]] = []
+    example_body: dict[str, Any] | None = None
+    req_body = op.get("requestBody") or {}
+    content = req_body.get("content") or {}
+    schema = None
+    for mt in ("application/json", "application/json; charset=utf-8"):
+        ms = content.get(mt)
+        if isinstance(ms, dict) and ms.get("schema"):
+            schema = ms["schema"]
+            break
+    if schema:
+        resolved = _resolve_schema(schema, {}) or schema
+        if isinstance(resolved, dict):
+            for prop_name, prop_schema in (resolved.get("properties") or {}).items():
+                if not isinstance(prop_schema, dict):
+                    continue
+                prop_type = _schema_type_str(prop_schema)
+                example = _example_value_for_field(prop_name, prop_type, prop_schema)
+                required_set = set(resolved.get("required") or [])
+                body_fields.append({
+                    "name": prop_name, "type": prop_type,
+                    "required": prop_name in required_set, "example": example,
+                })
+        example_body = _generate_example_json(schema, {})
+        if not isinstance(example_body, dict):
+            example_body = None
+
+    return {
+        "path_params": path_params,
+        "query_params": query_params,
+        "header_params": header_params,
+        "body_fields": body_fields,
+        "example_body": example_body,
+    }
+
+
+def _build_url(base_url: str, path: str, details: dict) -> str:
+    """Build URL with path param replacements and query string."""
+    url = f"{base_url.rstrip('/')}{path}"
+    for p in details["path_params"]:
+        url = url.replace("{" + p["name"] + "}", str(p["example"]))
+    if details["query_params"]:
+        qs = "&".join(f"{p['name']}={p['example']}" for p in details["query_params"])
+        url += f"?{qs}"
+    return url
+
+
+def _js_body_literal(details: dict) -> str:
+    """Return a JS object literal string from example_body or body_fields."""
+    if details["example_body"]:
+        return json.dumps(details["example_body"], indent=2)
+    if details["body_fields"]:
+        obj = {f["name"]: f["example"] for f in details["body_fields"]}
+        return json.dumps(obj, indent=2)
+    return "{}"
+
+
+def _dart_body_literal(details: dict) -> str:
+    """Return a Dart map literal string from example_body."""
+    body = details.get("example_body") or {f["name"]: f["example"] for f in details.get("body_fields", [])}
+    if not body:
+        return "{}"
+    pairs = []
+    for k, v in body.items():
+        if isinstance(v, str):
+            pairs.append(f"  '{k}': '{v}'")
+        elif isinstance(v, bool):
+            pairs.append(f"  '{k}': {'true' if v else 'false'}")
+        else:
+            pairs.append(f"  '{k}': {v}")
+    return "{\n" + ",\n".join(pairs) + "\n}"
+
+
+def _swift_body_literal(details: dict) -> str:
+    """Return a Swift dictionary literal from example_body."""
+    body = details.get("example_body") or {f["name"]: f["example"] for f in details.get("body_fields", [])}
+    if not body:
+        return "[:]"
+    pairs = []
+    for k, v in body.items():
+        if isinstance(v, str):
+            pairs.append(f'    "{k}": "{v}"')
+        elif isinstance(v, bool):
+            pairs.append(f'    "{k}": {"true" if v else "false"}')
+        else:
+            pairs.append(f'    "{k}": {v}')
+    return "[\n" + ",\n".join(pairs) + "\n  ]"
+
+
+def _kotlin_body_literal(details: dict) -> str:
+    """Return a Kotlin JSONObject builder from example_body."""
+    body = details.get("example_body") or {f["name"]: f["example"] for f in details.get("body_fields", [])}
+    if not body:
+        return 'JSONObject()'
+    pairs = []
+    for k, v in body.items():
+        if isinstance(v, str):
+            pairs.append(f'    .put("{k}", "{v}")')
+        elif isinstance(v, bool):
+            pairs.append(f'    .put("{k}", {"true" if v else "false"})')
+        else:
+            pairs.append(f'    .put("{k}", {v})')
+    return "JSONObject()\n" + "\n".join(pairs)
+
+
 def _template_example(
     method: str,
     path: str,
@@ -50,11 +186,14 @@ def _template_example(
     needs_auth: bool,
     body_summary: str,
     base_url: str,
+    operation: dict | None = None,
 ) -> str:
-    """Generate a deterministic code example without AI."""
-    url = f"{base_url.rstrip('/')}{path}"
+    """Generate a deterministic code example without AI, using actual schema data."""
+    details = _extract_operation_details(operation or {})
+    url = _build_url(base_url, path, details)
     method_upper = method.upper()
-    has_body = method_upper in ("POST", "PUT", "PATCH") and body_summary
+    has_body = method_upper in ("POST", "PUT", "PATCH") and (details["body_fields"] or details["example_body"] or body_summary)
+    body_json = _js_body_literal(details) if has_body else ""
 
     if stack == "vanilla":
         headers = []
@@ -63,16 +202,15 @@ def _template_example(
         if has_body:
             headers.append('    "Content-Type": "application/json",')
         headers_str = "\n".join(headers) if headers else ""
-        body_line = '\n  body: JSON.stringify({ /* see request body schema */ }),' if has_body else ""
+        body_line = f"\n  body: JSON.stringify({body_json})," if has_body else ""
         mid = ""
         if headers or has_body:
             mid = "\n  headers: {\n" + headers_str + "\n  }," + body_line
         return (
-            "// Store your JWT after login (e.g. from /api/auth/admin/verify-code)\n"
-            f"const token = \"YOUR_JWT_TOKEN\";\n"
-            f"const url = \"{url}\";\n\n"
+            f'const token = "YOUR_JWT_TOKEN";\n'
+            f'const url = "{url}";\n\n'
             "fetch(url, {\n"
-            f"  method: \"{method_upper}\",{mid}\n"
+            f'  method: "{method_upper}",{mid}\n'
             "})\n"
             "  .then((res) => res.json())\n"
             "  .then((data) => console.log(data))\n"
@@ -80,11 +218,10 @@ def _template_example(
         )
 
     if stack == "react-fetch":
-        body_line = '\n      body: JSON.stringify(payload),' if has_body else ""
-        auth_headers = '\n      headers: { ...headers, "Authorization": `Bearer ${token}` },' if needs_auth else "\n      headers,"
+        body_line = f"\n  body: JSON.stringify({body_json})," if has_body else ""
+        auth_headers = '\n  headers: { ...headers, "Authorization": `Bearer ${token}` },' if needs_auth else "\n  headers,"
         return (
-            "// In your component: get token from auth context or state\n"
-            "const token = \"YOUR_JWT\"; // e.g. from login response\n"
+            'const token = "YOUR_JWT";\n'
             'const headers = { "Content-Type": "application/json" };\n\n'
             f'const response = await fetch("{url}", {{\n'
             f'  method: "{method_upper}",{auth_headers}{body_line}\n'
@@ -95,22 +232,22 @@ def _template_example(
 
     if stack == "react-axios":
         auth = '\n  headers: { Authorization: `Bearer ${token}` },' if needs_auth else ""
-        body_arg = "\n  data: payload," if has_body else ""
+        body_arg = f", {body_json}" if has_body else ""
         base = base_url.rstrip("/")
+        ax_path = url.replace(base, "") or path
         return (
-            "import axios from \"axios\";\n\n"
-            "const token = \"YOUR_JWT\";\n"
+            'import axios from "axios";\n\n'
+            'const token = "YOUR_JWT";\n'
             "const api = axios.create({\n"
             f'  baseURL: "{base}",{auth}\n'
             "});\n\n"
-            f'const {{ data }} = await api.{method.lower()}("{path}"{body_arg});'
+            f'const {{ data }} = await api.{method.lower()}("{ax_path}"{body_arg});'
         )
 
     if stack == "vue3":
-        body_arg = ",\n    body: JSON.stringify(payload)" if has_body else ""
-        auth_line = '\n      "Authorization": `Bearer ${token}",' if needs_auth else ""
+        body_arg = f",\n  body: JSON.stringify({body_json})" if has_body else ""
+        auth_line = '\n    "Authorization": `Bearer ${token.value}`,' if needs_auth else ""
         return (
-            "// In setup(): token from pinia/store or inject\n"
             'const token = ref("YOUR_JWT");\n'
             f'const url = "{url}";\n\n'
             "const response = await fetch(url, {\n"
@@ -123,10 +260,9 @@ def _template_example(
         )
 
     if stack == "nextjs":
-        body_line = '\n  body: JSON.stringify(payload),' if has_body else ""
+        body_line = f"\n  body: JSON.stringify({body_json})," if has_body else ""
         auth_headers = '\n    Authorization: `Bearer ${token}`,' if needs_auth else ""
         return (
-            "// Server Action or route handler: pass token from session/cookies\n"
             'const token = "YOUR_JWT";\n'
             f'const res = await fetch("{url}", {{\n'
             f'  method: "{method_upper}",\n'
@@ -138,25 +274,23 @@ def _template_example(
         )
 
     if stack == "angular":
-        body_line = '\n    body: payload,' if has_body else ""
+        body_line = f"\n  body: {body_json}," if has_body else ""
         auth_headers = '\n    "Authorization": `Bearer ${this.authService.getToken()}`,' if needs_auth else ""
         return (
-            "// In your service: inject HttpClient and AuthService\n"
             f'const url = "{url}";\n'
-            "this.http.request<YourResponse>({\n"
+            "this.http.request<any>({\n"
             f'  method: "{method_upper}",\n'
-            '  url,\n'
+            "  url,\n"
             '  headers: { "Content-Type": "application/json"' + auth_headers + " }," + body_line + "\n"
-            "}).subscribe({ next: (data) => ..., error: (err) => ... });"
+            "}).subscribe({ next: (data) => console.log(data), error: (err) => console.error(err) });"
         )
 
     if stack == "svelte":
-        body_line = ',\n    body: JSON.stringify(payload)' if has_body else ""
-        auth_line = '\n      "Authorization": `Bearer ${token}`,' if needs_auth else ""
+        body_line = f",\n  body: JSON.stringify({body_json})" if has_body else ""
+        auth_line = '\n    "Authorization": `Bearer ${token}`,' if needs_auth else ""
         return (
-            "// In your component: token from store or prop\n"
             'let token = "YOUR_JWT";\n'
-            f'const url = "{url}";\n'
+            f'const url = "{url}";\n\n'
             "const res = await fetch(url, {\n"
             f'  method: "{method_upper}",\n'
             "  headers: {\n"
@@ -167,10 +301,9 @@ def _template_example(
         )
 
     if stack == "react-native":
-        body_line = '\n      body: JSON.stringify(payload),' if has_body else ""
-        auth_headers = '\n      headers: { ...headers, Authorization: `Bearer ${token}` },' if needs_auth else "\n      headers,"
+        body_line = f"\n  body: JSON.stringify({body_json})," if has_body else ""
+        auth_headers = '\n  headers: { ...headers, Authorization: `Bearer ${token}` },' if needs_auth else "\n  headers,"
         return (
-            "// Token from AsyncStorage or auth context\n"
             'const token = "YOUR_JWT";\n'
             'const headers = { "Content-Type": "application/json" };\n\n'
             f'const response = await fetch("{url}", {{\n'
@@ -180,10 +313,10 @@ def _template_example(
         )
 
     if stack == "flutter":
-        body_line = "\n  body: jsonEncode(payload)," if has_body else ""
-        auth_line = "\n  'Authorization': 'Bearer $token'," if needs_auth else ""
+        dart_body = _dart_body_literal(details) if has_body else ""
+        body_line = f"\n  body: jsonEncode({dart_body})," if has_body else ""
+        auth_line = "\n    'Authorization': 'Bearer $token'," if needs_auth else ""
         return (
-            "// token from your auth state / storage\n"
             "final token = 'YOUR_JWT';\n"
             f"final url = Uri.parse('{url}');\n"
             "final response = await http.request(\n"
@@ -196,54 +329,81 @@ def _template_example(
         )
 
     if stack == "swift-ios":
-        body_line = '\n    request.httpBody = try? JSONSerialization.data(withJSONObject: payload)' if has_body else ""
-        auth_line = '\n    request.setValue("Bearer \\(token)", forHTTPHeaderField: "Authorization")' if needs_auth else ""
+        swift_payload = _swift_body_literal(details) if has_body else ""
+        body_line = f'\nlet payload: [String: Any] = {swift_payload}\nrequest.httpBody = try? JSONSerialization.data(withJSONObject: payload)' if has_body else ""
+        auth_line = '\nrequest.setValue("Bearer \\(token)", forHTTPHeaderField: "Authorization")' if needs_auth else ""
         return (
-            "// token from Keychain or auth manager\n"
-            "let token = \"YOUR_JWT\"\n"
+            'let token = "YOUR_JWT"\n'
             f'let url = URL(string: "{url}")!\n'
             "var request = URLRequest(url: url)\n"
-            f"request.httpMethod = \"{method_upper}\"\n"
-            "request.setValue(\"application/json\", forHTTPHeaderField: \"Content-Type\")" + auth_line + body_line + "\n"
+            f'request.httpMethod = "{method_upper}"\n'
+            'request.setValue("application/json", forHTTPHeaderField: "Content-Type")' + auth_line + body_line + "\n"
             "let (data, _) = try await URLSession.shared.data(for: request)\n"
             "let decoded = try JSONDecoder().decode(YourModel.self, from: data)"
         )
 
     if stack == "kotlin-android":
+        kotlin_payload = _kotlin_body_literal(details) if has_body else ""
         body_part = (
-            '\n    .post(payload.toString().toRequestBody("application/json".toMediaType()))'
+            f'\nval payload = {kotlin_payload}\n'
+            '    .post(payload.toString().toRequestBody("application/json".toMediaType()))'
             if has_body
             else f'\n    .method("{method_upper}", null)'
         )
         auth_line = '\n    .addHeader("Authorization", "Bearer $token")' if needs_auth else ""
         return (
-            "// token from SharedPreferences or auth repository\n"
-            "val token = \"YOUR_JWT\"\n"
+            'val token = "YOUR_JWT"\n'
             f'val request = Request.Builder().url("{url}")' + auth_line + body_part + "\n"
             "    .build()\n"
             "val response = client.newCall(request).execute()\n"
             "val body = response.body?.string()"
         )
 
-    return _template_example(method, path, "vanilla", needs_auth, body_summary, base_url)
+    return _template_example(method, path, "vanilla", needs_auth, body_summary, base_url, operation)
 
 
-def _build_prompt(method: str, path: str, stack: str, summary: str, needs_auth: bool, body_summary: str, base_url: str) -> str:
-    url = f"{base_url.rstrip('/')}{path}"
+def _build_prompt(method: str, path: str, stack: str, summary: str, needs_auth: bool, body_summary: str, base_url: str, operation: dict | None = None) -> str:
+    details = _extract_operation_details(operation or {})
+    url = _build_url(base_url, path, details)
+
+    param_lines = ""
+    if details["path_params"]:
+        param_lines += "\nPath parameters:\n"
+        for p in details["path_params"]:
+            param_lines += f"  - {p['name']} ({p['type']}), example: {p['example']}\n"
+    if details["query_params"]:
+        param_lines += "Query parameters:\n"
+        for p in details["query_params"]:
+            req = "required" if p["required"] else "optional"
+            param_lines += f"  - {p['name']} ({p['type']}, {req}), example: {p['example']}\n"
+
+    body_section = "None."
+    if details["example_body"]:
+        body_section = f"JSON object with these fields:\n{json.dumps(details['example_body'], indent=2)}"
+    elif details["body_fields"]:
+        body_section = "JSON object with fields:\n"
+        for f in details["body_fields"]:
+            req = "required" if f["required"] else "optional"
+            body_section += f"  - {f['name']} ({f['type']}, {req}), example: {f['example']}\n"
+    elif body_summary:
+        body_section = f"JSON object with fields: {body_summary}"
+
     return f"""You are a documentation assistant. Generate a single, runnable code example for calling this API endpoint from a frontend application.
 
 Endpoint: {method.upper()} {path}
+Full URL (with example values): {url}
 Summary: {summary}
 Base URL: {base_url}
 Authentication: {"Required (Bearer JWT in Authorization header). Assume the token is available (e.g. from login)." if needs_auth else "None."}
-Request body: {"JSON object; mention the shape or use a placeholder comment if the schema is complex." if body_summary else "None."}
+{param_lines}Request body: {body_section}
 
 Stack: {stack}
 
 Requirements:
 - Output ONLY the code. No markdown fences, no explanation before or after.
 - Use the exact stack requested: {stack}.
-- For React: use functional components and hooks (e.g. useState for token if needed).
+- Use realistic example values for all parameters and request body fields as shown above.
+- For React: use functional components and hooks.
 - For Vue 3: use Composition API (ref, async).
 - For Next.js: use App Router; show fetch with headers.
 - Always include the Authorization: Bearer header when authentication is required.
@@ -275,7 +435,7 @@ def generate_example(
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
-            prompt = _build_prompt(method, path, stack, summary, needs_auth, body_summary, base_url)
+            prompt = _build_prompt(method, path, stack, summary, needs_auth, body_summary, base_url, op)
             resp = client.chat.completions.create(
                 model=settings.openai_model,
                 messages=[
@@ -297,7 +457,7 @@ def generate_example(
         except Exception as e:
             logger.warning("OpenAI example generation failed: %s", e)
 
-    return _template_example(method, path, stack, needs_auth, body_summary, base_url)
+    return _template_example(method, path, stack, needs_auth, body_summary, base_url, op)
 
 
 def get_operation(openapi_schema: dict, path: str, method: str) -> dict | None:

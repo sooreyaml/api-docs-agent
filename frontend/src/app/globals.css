@@ -52,3 +52,31 @@ body {
 .method-delete {
   @apply bg-rose-900/70 text-rose-300 px-1.5 py-0.5 rounded text-xs font-semibold uppercase tracking-wide;
 }
+
+/* CodeMirror dark theme integration */
+.codemirror-dark .cm-editor {
+  background: #0f172a !important;
+}
+.codemirror-dark .cm-gutters {
+  background: #0f172a !important;
+  border-right: 1px solid #1e293b !important;
+  color: #475569 !important;
+}
+.codemirror-dark .cm-activeLineGutter {
+  background: #1e293b !important;
+}
+.codemirror-dark .cm-activeLine {
+  background: rgba(30, 41, 59, 0.5) !important;
+}
+.codemirror-dark .cm-selectionBackground {
+  background: rgba(59, 130, 246, 0.2) !important;
+}
+.codemirror-dark .cm-cursor {
+  border-left-color: #94a3b8 !important;
+}
+.codemirror-dark .cm-content {
+  caret-color: #94a3b8;
+}
+.codemirror-dark .cm-scroller {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}

@@ -1,6 +1,6 @@
 /**
- * TypeScript types for GET /api/agent-docs and POST /api-reference/generate-example.
- * Use these in your frontend (Next.js, Lovable, etc.) for type-safe API responses.
+ * TypeScript types for GET /api/agent-docs, POST /api-reference/generate-example,
+ * and POST /api/try-it-out.
  */
 
 /** One parameter (query, path, header) */
@@ -9,6 +9,8 @@ export interface DocsParameter {
   in: string;
   required: boolean;
   description: string;
+  type: string;
+  example: string | number | boolean | null;
 }
 
 /** Schema summary for request/response body */
@@ -17,6 +19,7 @@ export interface DocsSchemaProperty {
   type: string;
   required: boolean;
   description: string;
+  example: string | number | boolean | null;
 }
 
 export interface DocsSchema {
@@ -55,6 +58,7 @@ export interface DocsEndpoint {
   how_to_call: DocsHowToCall;
   parameters: DocsParameter[];
   request_body_schema: DocsRequestBody | null;
+  example_body: Record<string, unknown> | null;
   responses: DocsResponse[];
 }
 
@@ -97,4 +101,21 @@ export interface GenerateExampleRequest {
 /** Response of POST /api-reference/generate-example */
 export interface GenerateExampleResponse {
   code: string;
+}
+
+/** Body for POST /api/try-it-out */
+export interface TryItOutRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string | null;
+  openapi_url?: string | null;
+}
+
+/** Response of POST /api/try-it-out */
+export interface TryItOutResponse {
+  status_code: number;
+  headers: Record<string, string>;
+  body: string;
+  elapsed_ms: number;
 }
